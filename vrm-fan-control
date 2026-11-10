@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Drive the CPU_FAN/CPU_OPT channel (VRM fans + CPU cooler) on the ASUS Zenith Extreme Alpha.
+
+The BIOS curve can only follow the CPU's Tctl, which on the Threadripper 1920X reads 27 °C too high,
+and it will not go below ~20 %. This daemon controls it87 pwm1 from the real temperatures instead:
+whichever of the VRM temperature or the CPU's Tdie needs more cooling wins.
+
+Settings come from /etc/default/vrm-fan-control (see IDLE_PWM etc. below).
+If anything goes wrong, or the service stops, control is handed back to the BIOS (pwm1_enable = 2).
+"""
+import glob
+import os
+import signal
+import sys
+import time
+
+IDLE_PWM = int(os.environ.get("IDLE_PWM", "30"))            # quiet floor, 0-255
+VRM_RAMP_START = float(os.environ.get("VRM_RAMP_START", "60"))  # °C where the VRM ramp begins
+VRM_FULL = float(os.environ.get("VRM_FULL", "85"))              # °C for 100 %
+CPU_RAMP_START = float(os.environ.get("CPU_RAMP_START", "55"))  # real CPU temperature (Tdie)
+CPU_FULL = float(os.environ.get("CPU_FULL", "80"))
+INTERVAL_SECONDS = 2
+STEP_DOWN_LIMIT = 4  # pwm units per interval when cooling down, so the fans do not flap
+
+BIOS_AUTOMATIC_MODE = "2"
+MANUAL_MODE = "1"
+
+
+def find_hwmon(name):
+    for directory in glob.glob("/sys/class/hwmon/hwmon*"):
+        with open(f"{directory}/name") as handle:
+            if handle.read().strip() == name:
+                return directory
+    return None
+
+
+def read_labelled_temperature(hwmon, wanted_label):
+    for label_file in glob.glob(f"{hwmon}/temp*_label"):
+        with open(label_file) as handle:
+            if handle.read().strip() == wanted_label:
+                with open(label_file.replace("_label", "_input")) as value:
+                    return int(value.read()) / 1000
+    raise RuntimeError(f"temperature '{wanted_label}' not found in {hwmon}")
+
+
+def ramp(temperature, start, full):
+    if temperature <= start:
+        return IDLE_PWM
+    if temperature >= full:
+        return 255
+    return round(IDLE_PWM + (255 - IDLE_PWM) * (temperature - start) / (full - start))
+
+
+def write(path, value):
+    with open(path, "w") as handle:
+        handle.write(str(value))
+
+
+def main():
+    fan_chip = find_hwmon("it8665")
+    board_sensors = find_hwmon("asus_wmi_sensors")
+    cpu_sensors = find_hwmon("k10temp")
+    if not (fan_chip and board_sensors and cpu_sensors):
+        sys.exit(f"missing hwmon device: it8665={fan_chip} asus_wmi_sensors={board_sensors} k10temp={cpu_sensors}")
+
+    pwm = f"{fan_chip}/pwm1"
+    pwm_enable = f"{fan_chip}/pwm1_enable"
+
+    def hand_back_to_bios(*_):
+        write(pwm_enable, BIOS_AUTOMATIC_MODE)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, hand_back_to_bios)
+    signal.signal(signal.SIGINT, hand_back_to_bios)
+
+    current = None
+    write(pwm_enable, MANUAL_MODE)
+    try:
+        while True:
+            vrm = read_labelled_temperature(board_sensors, "CPU VRM Temperature")
+            cpu = read_labelled_temperature(cpu_sensors, "Tdie")
+            target = max(ramp(vrm, VRM_RAMP_START, VRM_FULL), ramp(cpu, CPU_RAMP_START, CPU_FULL))
+            # Start straight at the target; afterwards rise immediately but fall slowly so the fans do not flap.
+            current = target if current is None or target > current else max(target, current - STEP_DOWN_LIMIT)
+            write(pwm, current)
+            time.sleep(INTERVAL_SECONDS)
+    except Exception as error:
+        print(f"error, handing fans back to the BIOS: {error}", file=sys.stderr)
+        write(pwm_enable, BIOS_AUTOMATIC_MODE)
+        raise
+
+
+if __name__ == "__main__":
+    main()

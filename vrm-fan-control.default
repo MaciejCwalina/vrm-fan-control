@@ -1,0 +1,6 @@
+# Idle floor for the VRM fans + CPU cooler (0-255). 25-40 tested as quiet.
+IDLE_PWM=40
+VRM_RAMP_START=60
+VRM_FULL=85
+CPU_RAMP_START=55
+CPU_FULL=80

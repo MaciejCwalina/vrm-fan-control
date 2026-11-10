@@ -1,0 +1,15 @@
+[Unit]
+Description=Quiet VRM fan + CPU cooler control from real VRM/CPU temperatures (it87 pwm1)
+After=systemd-modules-load.service
+
+[Service]
+EnvironmentFile=/etc/default/vrm-fan-control
+ExecStartPre=/sbin/modprobe it87
+ExecStart=/usr/local/bin/vrm-fan-control
+# Whatever happens, give the fans back to the BIOS curve when the service stops.
+ExecStopPost=/bin/sh -c 'for d in /sys/class/hwmon/hwmon*; do [ "$(cat $d/name)" = it8665 ] && echo 2 > $d/pwm1_enable; done; true'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
